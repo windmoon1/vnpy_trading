@@ -65,14 +65,29 @@ SCHEMA_MAP = {
             ("symbol", ASCENDING), ("date", ASCENDING)
         ],
 
-        # --- 1.6 财务报表 (Financial - PIT) ---
-        # [字段]: revenue, net_profit, roe, gross_margin, debt_to_asset ...
-        # [关键]: 必须存 publish_date (公告日)，回测时只能用公告日之前的数据。
-        "finance_report": [
+        # --- 1.6 财务报表 (Financial - PIT Mode) [NEW] ---
+        # 我们将三大表拆分存储，支持 Point-in-Time (公告日) 查询
+        # [索引]: symbol + report_date (唯一确定一期财报)
+        # [查询]: 通常按 symbol 查，按 publish_date 过滤
+
+        "finance_balance": [  # 资产负债表
+            ("symbol", ASCENDING), ("report_date", DESCENDING), ("publish_date", DESCENDING)
+        ],
+        "finance_income": [  # 利润表
+            ("symbol", ASCENDING), ("report_date", DESCENDING), ("publish_date", DESCENDING)
+        ],
+        "finance_cashflow": [  # 现金流量表
             ("symbol", ASCENDING), ("report_date", DESCENDING), ("publish_date", DESCENDING)
         ],
 
-        # --- 1.7 游资/情绪分析 (Analysis - 阴阳双极) ---
+        # --- 1.7 股本变动 (Capital Structure) [NEW] ---
+        # [字段]: total_shares (总股本), float_shares (流通股本), change_reason (变动原因)
+        # [用途]: 计算每日 PE, PB, 市值
+        "share_capital": [
+            ("symbol", ASCENDING), ("date", ASCENDING)
+        ],
+
+        # --- 1.8 游资/情绪分析 (Analysis - 阴阳双极) ---
         # > 涨停分析 (Greed)
         # [字段]: is_limit_up, limit_seq (连板数), limit_amount (封单额),
         #         limit_time (首封时间), limit_success (炸板否)
@@ -86,7 +101,7 @@ SCHEMA_MAP = {
             ("symbol", ASCENDING), ("date", ASCENDING)
         ],
 
-        # --- 1.8 历史档案 (Meta History) ---
+        # --- 1.9 历史档案 (Meta History) ---
         # > 行业历史 (用于回测板块轮动) - 记录某只票在2015年属于什么行业
         "industry_history": [("symbol", ASCENDING), ("date", ASCENDING)],
         # > 状态历史 (用于防雷) - 记录 ST, *ST, 停牌, 退市整理期
