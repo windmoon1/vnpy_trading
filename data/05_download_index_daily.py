@@ -1,20 +1,19 @@
 """
-脚本 05: 核心指数日线下载器 (Benchmark)
+脚本 05: 核心指数日线下载器 (v2.1 - 单位修正版)
 ---------------------------------------
-目标: 下载核心宽基指数日线数据，作为策略回测的基准 (Benchmark) 和 择时信号源。
-数据源: 东方财富 (ak.stock_zh_index_daily_em)
-    - 相比新浪接口，东财数据包含 '成交额' 且历史更完整。
-    - 涵盖: 上证, 深证, 沪深300, 中证500, 中证1000, 创业板, 科创50, 北证50。
+更新日志:
+- [Fix] 统一量纲: 成交量 (Volume) 自动乘以 100 (手 -> 股)。
+- [Feat] 断点续传 + 智能重试 + 随机延迟 (继承自 v2.0)。
 """
-
 import os
 import time
+import random
+import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
 from pymongo import UpdateOne, MongoClient
 from vnpy.trader.constant import Exchange, Interval
 import akshare as ak
-import pandas as pd
 
 # --- 🛡️ 直连补丁 ---
 os.environ['http_proxy'] = ''
@@ -23,50 +22,50 @@ os.environ['all_proxy'] = ''
 os.environ['NO_PROXY'] = '*'
 
 # --- 配置 ---
-# 既然是基准，我们尽量拉取全量历史
 START_DATE = "19900101"
+MAX_RETRIES = 5
+RETRY_DELAY = 30
+NORMAL_DELAY = (30, 60)
 
 # --- 核心指数清单 ---
-# 格式: "代码": (交易所枚举, "中文名称")
-# 注意: vn.py 的 Exchange 枚举通常用于个股。对于指数，我们约定：
-# 上交所指数 -> Exchange.SSE
-# 深交所指数 -> Exchange.SZSE
-# 北交所指数 -> Exchange.BSE
 INDEX_CONFIG = {
-    # --- 1. 市场总貌 (The Market) ---
-    "000001": (Exchange.SSE, "上证指数"),  # 也就是大盘
-    "399001": (Exchange.SZSE, "深证成指"),
-
-    # --- 2. 规模宽基 (Size Benchmarks) ---
-    "000300": (Exchange.SSE, "沪深300"),  # 大盘蓝筹 (核心基准)
-    "000905": (Exchange.SSE, "中证500"),  # 中盘成长 (IC标的)
-    "000852": (Exchange.SSE, "中证1000"),  # 小盘股 (IM标的)
-    "399006": (Exchange.SZSE, "创业板指"),  # 成长/科技
-    "000688": (Exchange.SSE, "科创50"),  # 硬科技
-    "899050": (Exchange.BSE, "北证50"),  # 专精特新
-
-    # --- 3. 策略风格 (Smart Beta) ---
-    "000016": (Exchange.SSE, "上证50"),  # 超大盘/金融
-    "000985": (Exchange.SSE, "中证全指"),  # 全市场代表
+    "000001": (Exchange.SSE, "上证指数", "sh000001"),
+    "399001": (Exchange.SZSE, "深证成指", "sz399001"),
+    "000300": (Exchange.SSE,  "沪深300", "sh000300"),
+    "000905": (Exchange.SSE,  "中证500", "sh000905"),
+    "000852": (Exchange.SSE,  "中证1000", "sh000852"),
+    "399006": (Exchange.SZSE, "创业板指", "sz399006"),
+    "000688": (Exchange.SSE,  "科创50",   "sh000688"),
+    "000016": (Exchange.SSE,  "上证50",   "sh000016"),
+    "000985": (Exchange.SSE,  "中证全指", "sh000985"),
 }
 
-# --- 数据库连接 ---
+# --- 数据库 ---
 CLIENT = MongoClient("localhost", 27017)
-# 存入 vnpy_stock 库中的 index_daily 表
 col_index = CLIENT["vnpy_stock"]["index_daily"]
 col_info = CLIENT["vnpy_stock"]["index_info"]
 
+def get_downloaded_symbols():
+    try:
+        return set(col_index.distinct("symbol"))
+    except:
+        return set()
 
 def save_index_data(symbol, exchange, name, df):
-    if df.empty: return
+    if df.empty: return 0
 
     updates = []
     for _, row in df.iterrows():
         try:
-            # akshare 东财接口返回列名: date, open, close, high, low, volume, amount...
-            # 日期处理: 可能是字符串 "2023-01-01"
-            dt_str = str(row['date']).split()[0]
-            dt = datetime.strptime(dt_str, "%Y-%m-%d")
+            date_val = row['date']
+            if isinstance(date_val, str):
+                dt = datetime.strptime(date_val.split()[0], "%Y-%m-%d")
+            else:
+                dt = date_val
+
+            # 🚨 核心修正: 东财 Volume 单位为手，需转为股 (x100)
+            vol_hand = float(row['volume'])
+            vol_share = vol_hand * 100
 
             doc = {
                 "symbol": symbol,
@@ -77,8 +76,8 @@ def save_index_data(symbol, exchange, name, df):
                 "high_price": float(row['high']),
                 "low_price": float(row['low']),
                 "close_price": float(row['close']),
-                "volume": float(row['volume']),
-                "turnover": float(row['amount']),  # 指数成交额通常很大
+                "volume": vol_share,          # ✅ 已修正为股
+                "turnover": float(row['amount']),
                 "gateway_name": "AKSHARE_EM_INDEX"
             }
 
@@ -94,8 +93,6 @@ def save_index_data(symbol, exchange, name, df):
 
     if updates:
         col_index.bulk_write(updates)
-
-        # 同时更新 Index 基础信息
         col_info.update_one(
             {"symbol": symbol},
             {"$set": {
@@ -106,32 +103,54 @@ def save_index_data(symbol, exchange, name, df):
             }},
             upsert=True
         )
+        return len(updates)
+    return 0
 
+def fetch_with_retry(api_symbol, name):
+    for attempt in range(MAX_RETRIES):
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=api_symbol)
+            return df
+        except Exception as e:
+            print(f"\n⚠️  [{name}] 下载受阻 (第 {attempt+1}/{MAX_RETRIES} 次): {e}")
+            if attempt < MAX_RETRIES - 1:
+                print(f"⏳ 触发熔断保护，冷却 {RETRY_DELAY} 秒后重试...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"❌ [{name}] 彻底失败，跳过。")
+                raise e
 
 def run():
-    print("🚀 启动 [脚本 05] 核心指数下载任务...")
+    print("🚀 启动 [指数数据下载器 v2.1] (单位: 股 | 智能抗封锁)...")
 
-    # 将字典转换为进度条列表
-    pbar = tqdm(INDEX_CONFIG.items(), unit="index")
+    done_set = get_downloaded_symbols()
+    print(f"📚 数据库已收录: {len(done_set)} 个指数 (将跳过)")
 
-    for symbol, (exchange, name) in pbar:
+    tasks = []
+    for symbol, meta in INDEX_CONFIG.items():
+        if symbol in done_set:
+            continue
+        tasks.append((symbol, meta))
+
+    if not tasks:
+        print("✨ 所有指数数据已就绪，无需下载。")
+        return
+
+    print(f"🎯 本次待下载: {len(tasks)} 个")
+    print("-" * 60)
+
+    pbar = tqdm(tasks, unit="idx")
+    for symbol, (exchange, name, api_symbol) in pbar:
         pbar.set_description(f"下载 {name}")
-
         try:
-            # 核心接口: 东方财富指数历史数据
-            # 该接口返回数据质量较高，且包含历史全量
-            df = ak.stock_zh_index_daily_em(symbol=symbol)
-
+            df = fetch_with_retry(api_symbol, name)
             save_index_data(symbol, exchange, name, df)
+        except Exception:
+            continue
 
-        except Exception as e:
-            pbar.write(f"❌ {name} ({symbol}) 下载失败: {e}")
-            time.sleep(1)
+        time.sleep(random.uniform(*NORMAL_DELAY))
 
-        time.sleep(0.5)  # 避免由于请求过快被封IP
-
-    print("\n✨ 核心指数数据注入完成！(Database: vnpy_stock.index_daily)")
-
+    print("\n✨ 任务全部完成！(Database: vnpy_stock.index_daily)")
 
 if __name__ == "__main__":
     run()
