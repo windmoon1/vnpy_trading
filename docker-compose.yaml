@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # 服务1: MongoDB 数据库
+  mongodb:
+    image: mongo:7.0           # 使用 7.0 版本镜像
+    container_name: vnpy-mongo # 给集装箱起个名字，方便找
+    restart: always            # 开机或崩溃后自动重启
+    ports:
+      - "27017:27017"          # 端口映射：把集装箱的27017映射到你Mac的27017
+    environment:
+      MONGO_INITDB_DATABASE: vnpy_data # 默认创建的数据库名
+    volumes:
+      # --- 关键点 ---
+      # 这行代码把 Docker 里的数据，实时同步到你 Mac 的 ~/vnpy_data_db 文件夹
+      # 这样即使你删了 Docker，数据还在你的硬盘里！
+      - ~/vnpy_data_db:/data/db
+
+  # 服务2: 可视化管理界面 (可选，送你的福利)
+  mongo-express:
+    image: mongo-express
+    container_name: vnpy-admin
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin # 网页登录账号
+      ME_CONFIG_BASICAUTH_PASSWORD: pass  # 网页登录密码
+    depends_on:
+      - mongodb

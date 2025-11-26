@@ -1,0 +1,30 @@
+# ----------------------------------------------------
+# 1. VNPY / Local Config (CRITICAL SECURITY)
+# ----------------------------------------------------
+# 包含数据库密码、API Key、本地路径等敏感信息，绝不能上传！
+vt_setting.json
+.vntrader/
+
+# ----------------------------------------------------
+# 2. Python & IDE Artifacts
+# ----------------------------------------------------
+# Compiled Python files
+__pycache__/
+*.pyc
+
+# Virtual Environment
+.venv/
+env/
+*.sqlite # 忽略vn.py默认的SQLite数据库文件
+*.db
+
+# Jupyter/Data Science
+.ipynb_checkpoints/
+*.csv
+*.xlsx
+
+# Mac OS junk
+.DS_Store
+
+# Pycharm local files (Optional, but usually good)
+.idea/
