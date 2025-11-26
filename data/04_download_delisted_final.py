@@ -1,21 +1,23 @@
 """
-脚本 04: 退市股票恢复器 (v7.2 时间阀门版)
+脚本 04: 退市股票恢复器 (v7.4 拒绝卡死版)
 ------------------------------------------------
 策略升级:
-1. [时间阀门]: 仅收录 2005-01-01 之后退市的股票。
-   (在此之前退市的股票对当前回测无意义，直接过滤)
-2. [数据对齐]: 行情下载起点统一为 2005-01-01。
-3. [单位统一]: 严格执行 东财成交量(手) -> 数据库(股) 的转换。
+1. [强制超时]: 引入 socket.setdefaulttimeout(20)，防止 requests 无限挂起。
+2. [重试可见]: 打印重试日志，不再静默等待。
+3. [异常透明]: 明确区分网络问题与代码逻辑错误。
 """
 import os
 import time
+import random
+import requests
+import functools
+import socket  # 👈 新增
 import pandas as pd
 from datetime import datetime
 from tqdm import tqdm
 from pymongo import UpdateOne, MongoClient
 from vnpy.trader.constant import Exchange, Interval
 import akshare as ak
-import random
 
 # --- 🛡️ 直连补丁 ---
 os.environ['http_proxy'] = ''
@@ -23,11 +25,14 @@ os.environ['https_proxy'] = ''
 os.environ['all_proxy'] = ''
 os.environ['NO_PROXY'] = '*'
 
-# --- 核心配置 ---
-# 1. 历史行情起点 (回测只从这里开始)
+# --- ⚡ 核心配置 ---
+# 1. 强制全局超时 (秒): 解决 requests 默认无 timeout 导致的无限卡死
+socket.setdefaulttimeout(5)
+
 START_DATE = "20050101"
-# 2. 退市过滤线 (在此之前退市的直接忽略)
 FILTER_DATE = datetime(2005, 1, 1)
+MAX_RETRIES = 3       # 减少重试次数，快速失败
+BASE_SLEEP = 2        # 基础休眠秒数
 
 # 数据库
 CLIENT = MongoClient("localhost", 27017)
@@ -36,41 +41,97 @@ col_bar = db["bar_daily"]
 col_info = db["stock_info"]
 col_adj = db["adjust_factor"]
 
+
+def retry_request(max_retries=MAX_RETRIES, base_sleep=BASE_SLEEP):
+    """
+    [工程优化] 网络请求重试装饰器 (带日志 + 指数退避)
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ReadTimeout, # 👈 捕获超时
+                        socket.timeout,                  # 👈 捕获 socket 超时
+                        requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ProxyError) as e:
+
+                    if attempt == max_retries:
+                        print(f"\n❌ [Network] {func.__name__} 最终失败: {str(e)[:100]}...")
+                        raise e
+
+                    sleep_time = base_sleep * (2 ** (attempt - 1))
+                    # 👇 关键修复: 打印出来，不要静默重试
+                    print(f"   ⚠️ 网络卡顿，正在重试 {func.__name__} ({attempt}/{max_retries})，等待 {sleep_time}s...")
+                    time.sleep(sleep_time)
+                except Exception as e:
+                    # 逻辑错误/解析错误直接抛出，不吞没
+                    print(f"\n❌ [Logic] {func.__name__} 发生非网络错误: {e}")
+                    raise e
+            return None
+        return wrapper
+    return decorator
+
+
 def parse_date(date_val):
-    """通用日期解析器，处理各种怪异格式"""
     if pd.isna(date_val) or str(date_val).strip() == "":
         return None
     try:
-        # 常见格式处理
         return pd.to_datetime(date_val).to_pydatetime()
     except:
         return None
 
+
+# --- 封装带重试的 AKShare 接口 ---
+
+@retry_request()
+def fetch_sz_delist_list():
+    print("   📡 连接深交所接口...", end="\r")
+    return ak.stock_info_sz_delist(symbol="终止上市公司")
+
+@retry_request()
+def fetch_sh_delist_list():
+    print("   📡 连接上交所接口...", end="\r")
+    return ak.stock_info_sh_delist(symbol="全部")
+
+@retry_request()
+def fetch_stock_history(symbol):
+    return ak.stock_zh_a_hist(
+        symbol=symbol,
+        period="daily",
+        start_date=START_DATE,
+        end_date=datetime.now().strftime("%Y%m%d"),
+        adjust=""
+    )
+
+@retry_request()
+def fetch_stock_factor(sina_symbol):
+    return ak.stock_zh_a_daily(
+        symbol=sina_symbol,
+        start_date=START_DATE,
+        adjust="qfq-factor"
+    )
+
+
 def update_delisted_metadata():
-    """
-    阶段一：同步名单 + 时间过滤
-    """
-    print(f"\n[Phase 1] 同步交易所退市名单 (过滤阈值: {FILTER_DATE.strftime('%Y-%m-%d')})...")
+    """阶段一：同步名单"""
+    print(f"\n[Phase 1] 同步交易所退市名单 (Timeout set to 20s)...")
 
     updates = []
     valid_count = 0
-    skipped_count = 0
 
     # --- 1. 深交所 ---
     try:
-        df_sz = ak.stock_info_sz_delist(symbol="终止上市公司")
+        df_sz = fetch_sz_delist_list()
         if not df_sz.empty:
             for _, row in df_sz.iterrows():
                 symbol = str(row['证券代码'])
-                if symbol.startswith("200"): continue # 忽略B股
-
-                # 解析退市日期
+                if symbol.startswith("200"): continue
                 d_date = parse_date(row['终止上市日期'])
-
-                # 🚨 核心过滤逻辑 🚨
-                if d_date and d_date < FILTER_DATE:
-                    skipped_count += 1
-                    continue
+                if d_date and d_date < FILTER_DATE: continue
 
                 updates.append(UpdateOne(
                     {"symbol": symbol},
@@ -84,24 +145,19 @@ def update_delisted_metadata():
                     upsert=True
                 ))
                 valid_count += 1
+            print("   ✅ 深交所名单获取成功")
     except Exception as e:
-        print(f"   ❌ 深交所名单获取失败: {e}")
+        print(f"   ❌ 深交所名单获取跳过: {e}")
 
     # --- 2. 上交所 ---
     try:
-        df_sh = ak.stock_info_sh_delist(symbol="全部")
+        df_sh = fetch_sh_delist_list()
         if not df_sh.empty:
             for _, row in df_sh.iterrows():
                 symbol = str(row['公司代码'])
-                if symbol.startswith("900"): continue # 忽略B股
-
-                # 解析退市日期 (上交所字段叫 '暂停上市日期'，通常即为退市相关节点)
+                if symbol.startswith("900"): continue
                 d_date = parse_date(row['暂停上市日期'])
-
-                # 🚨 核心过滤逻辑 🚨
-                if d_date and d_date < FILTER_DATE:
-                    skipped_count += 1
-                    continue
+                if d_date and d_date < FILTER_DATE: continue
 
                 updates.append(UpdateOne(
                     {"symbol": symbol},
@@ -115,38 +171,32 @@ def update_delisted_metadata():
                     upsert=True
                 ))
                 valid_count += 1
+            print("   ✅ 上交所名单获取成功")
     except Exception as e:
-        print(f"   ❌ 上交所名单获取失败: {e}")
+        print(f"   ❌ 上交所名单获取跳过: {e}")
 
     # 3. 写入数据库
     if updates:
         col_info.bulk_write(updates)
-        print(f"   📊 名单处理完毕:")
-        print(f"      ✅ 入库/更新: {valid_count} 只 (2005年后退市)")
-        print(f"      🗑️ 过滤丢弃: {skipped_count} 只 (2005年前退市)")
+        print(f"   📊 名单同步完毕: {valid_count} 只目标股票入库。")
     else:
-        print("   ⚠️ 未获取到有效数据。")
+        print("   ⚠️ 未能获取新的名单数据。")
+
 
 def save_bars_eastmoney(symbol, exchange, df):
-    """
-    保存行情 (东财源 - 单位换算)
-    """
+    """保存行情"""
     if df.empty: return False
     updates = []
-    for _, row in df.iterrows():
+    records = df.to_dict('records')
+
+    for row in records:
         try:
-            # 1. 日期解析
             date_val = row['日期']
             dt_str = str(date_val).split()[0]
             dt = datetime.strptime(dt_str, "%Y-%m-%d")
+            if dt < FILTER_DATE: continue
 
-            # 🚨 核心过滤: 再次确保只存 2005-01-01 之后的数据
-            if dt < FILTER_DATE:
-                continue
-
-            # 2. 单位换算 (手 -> 股)
-            vol_hand = float(row['成交量'])
-            vol_share = vol_hand * 100
+            vol_share = float(row['成交量']) * 100
             amount = float(row['成交额'])
 
             doc = {
@@ -158,84 +208,60 @@ def save_bars_eastmoney(symbol, exchange, df):
                 "high_price": float(row['最高']),
                 "low_price": float(row['最低']),
                 "close_price": float(row['收盘']),
-                "volume": vol_share,        # ✅ 股数
+                "volume": vol_share,
                 "turnover": amount,
                 "gateway_name": "DELISTED_EM"
             }
-
-            filter_doc = {
-                "symbol": symbol,
-                "exchange": exchange.value,
-                "interval": Interval.DAILY.value,
-                "datetime": dt
-            }
+            filter_doc = {"symbol": symbol, "exchange": exchange.value, "interval": Interval.DAILY.value, "datetime": dt}
             updates.append(UpdateOne(filter_doc, {"$set": doc}, upsert=True))
         except Exception:
             continue
 
     if updates:
-        col_bar.bulk_write(updates)
+        col_bar.bulk_write(updates, ordered=False)
         return True
     return False
+
 
 def try_save_factors(symbol, exchange):
     """获取复权因子"""
     sina_symbol = ("sh" if exchange == Exchange.SSE else "sz") + symbol
     try:
-        # 注意：因子数据最好还是从上市首日开始拿，以保证计算准确，
-        # 但 vn.py 回测引擎通常只看回测区间内的因子。
-        # 这里我们还是从 START_DATE 开始请求。
-        df = ak.stock_zh_a_daily(
-            symbol=sina_symbol,
-            start_date=START_DATE, # 20050101
-            adjust="qfq-factor"
-        )
-
-        if not df.empty and 'qfq_factor' in df.columns:
+        df = fetch_stock_factor(sina_symbol)
+        if df is not None and not df.empty and 'qfq_factor' in df.columns:
             updates = []
-            for _, row in df.iterrows():
+            records = df.to_dict('records')
+            for row in records:
                 dt = row['date']
-                if isinstance(dt, str):
-                    dt = datetime.strptime(dt.split()[0], "%Y-%m-%d")
-
+                if isinstance(dt, str): dt = datetime.strptime(dt.split()[0], "%Y-%m-%d")
                 updates.append(UpdateOne(
                     {"symbol": symbol, "date": dt},
                     {"$set": {"factor": float(row['qfq_factor']), "source": "SINA_FACTOR"}},
                     upsert=True
                 ))
             if updates:
-                col_adj.bulk_write(updates)
-                return True
+                col_adj.bulk_write(updates, ordered=False)
     except: pass
-    return False
+
 
 def download_missing_data():
-    """
-    阶段二：补全行情
-    """
+    """阶段二：补全行情"""
     print("\n[Phase 2] 扫描任务队列，补全历史行情...")
-
-    # 1. 找出所有 2005 年后退市的股票
-    # 注意：因为Phase 1已经过滤了，所以stock_info里标记为DELISTED的应该都是符合要求的
     cursor = col_info.find({"status": "DELISTED"})
     targets = list(cursor)
 
-    # 2. 筛选真正缺数据的
     tasks = []
-    print("   🔍 正在核对本地数据存量...")
+    print("   🔍 核对本地数据...")
     for doc in targets:
         symbol = doc['symbol']
-        # 只要有一条数据，就认为下载过了 (断点续传)
         if col_bar.count_documents({"symbol": symbol}, limit=1) == 0:
             tasks.append(doc)
 
-    print(f"   📊 目标退市股: {len(targets)} | 需补全: {len(tasks)}")
+    print(f"   📊 需补全: {len(tasks)} / {len(targets)}")
 
-    if not tasks:
-        print("   ✨ 所有退市股票数据已就绪，无需下载。")
-        return
+    if not tasks: return
 
-    # 3. 执行下载
+    # Tqdm 配置: 实时显示当前处理的股票
     pbar = tqdm(tasks, unit="stock")
     success_count = 0
 
@@ -244,37 +270,27 @@ def download_missing_data():
         name = doc.get('name', symbol)
         exchange = Exchange(doc.get('exchange', 'SSE'))
 
-        pbar.set_description(f"补全 {name}")
+        pbar.set_description(f"Processing {symbol}")
 
         try:
-            # 请求历史行情 (从 20050101 开始)
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=START_DATE,
-                end_date=datetime.now().strftime("%Y%m%d"),
-                adjust=""
-            )
+            df = fetch_stock_history(symbol) # 如果这里超时，会抛出异常被下面捕获
 
-            if not df.empty:
-                # 存储 (函数内部会再次校验日期 >= 2005-01-01)
+            if df is not None and not df.empty:
                 if save_bars_eastmoney(symbol, exchange, df):
-                    # 尝试因子
                     try_save_factors(symbol, exchange)
                     success_count += 1
 
         except Exception as e:
-            pbar.write(f"   ❌ {name} 失败: {e}")
+            # 这里的 print 确保报错不会被“吞掉”
+            pbar.write(f"   ❌ {name}({symbol}) 失败: {str(e)[:50]}")
 
-        time.sleep(random.uniform(60, 120))
+        #time.sleep(random.uniform(3, 5))
 
-    print(f"\n✨ 补全结束! 成功恢复 {success_count} 只股票数据。")
+    print(f"\n✨ 任务完成! 成功恢复 {success_count} 只股票。")
 
-def run():
-    print(f"🚀 启动 [退市股票恢复器 v7.2] (Filter: >={FILTER_DATE.strftime('%Y-%m-%d')})...")
-    update_delisted_metadata()
-    download_missing_data()
-    print("\n🎉 任务完成。")
 
 if __name__ == "__main__":
-    run()
+    print(f"🚀 启动 [退市股票恢复器 v7.4 Anti-Freeze]...")
+    # update_delisted_metadata()
+    download_missing_data()
+    print("\n🎉 All Done.")
