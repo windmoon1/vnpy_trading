@@ -20,8 +20,8 @@ env/
 
 # Jupyter/Data Science
 .ipynb_checkpoints/
-# *.csv
-# *.xlsx
+*.csv
+*.xlsx
 
 # Mac OS junk
 .DS_Store
