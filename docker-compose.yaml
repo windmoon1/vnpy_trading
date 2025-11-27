@@ -30,3 +30,13 @@ services:
       ME_CONFIG_BASICAUTH_PASSWORD: pass  # 网页登录密码
     depends_on:
       - mongodb
+
+  # --- 新增服务: Redis ---
+  redis:
+    image: redis:7.2
+    container_name: vnpy-redis
+    restart: always
+    ports:
+      - "6379:6379"  # 必须映射端口，这样你的 Python 脚本才能连接
+    volumes:
+      - ~/vnpy_redis_data:/data # 数据持久化，重启不丢失 IP
