@@ -1,15 +1,21 @@
 """
-Script 10: Download Shenwan Industry History (The Real Fix)
------------------------------------------------------------
-核心修复:
-1. [关键] 修正参数名: "申万行业分类标准" -> "申银万国行业分类标准"。
-   这是 akshare 源码中定义的唯一正确 Key。
-2. [关键] 数据库字段映射: 将 API 返回的 start_date 映射为 date。
-3. 完整流程: 自动构建字典 -> 下载历史 -> 汉化名称 -> 入库。
+Script 10: Rebuild Industry History with Full Hierarchy
+-------------------------------------------------------
+目标: 重构行业历史表 (industry_history)
+流程:
+1. [清理] 清空现有 industry_history 表 (从零开始)。
+2. [映射] 读取本地 sw_2021.csv (Sheet1), 构建全层级映射字典 (Code -> L1/L2/L3)。
+3. [下载] 在线拉取申万个股历史数据 (ak.stock_industry_clf_hist_sw)。
+4. [入库] 将历史数据的 Code 翻译为全层级结构并存储。
+
+注意:
+如果线上数据包含旧版代码(如4xxxx)而Sheet1只有新版代码(11xxxx),
+未匹配的记录将只存储原始代码，标记 is_mapped=False。
 """
 
 import akshare as ak
 import pandas as pd
+import os
 from datetime import datetime
 from tqdm import tqdm
 from pymongo import MongoClient, UpdateOne
@@ -21,136 +27,183 @@ MONGO_HOST = "localhost"
 MONGO_PORT = 27017
 DB_NAME = "vnpy_stock"
 COLLECTION_NAME = "industry_history"
+MAPPING_FILE = "data/行业分类.csv"  # 请确保你已将 Sheet1.csv 重命名为此文件名
 
 def get_db():
     return MongoClient(MONGO_HOST, MONGO_PORT)[DB_NAME]
 
-def build_correct_mapping():
+def load_full_hierarchy_map(file_path):
     """
-    从巨潮资讯构建申万行业代码字典
-    Target: { '480301': '银行II', '440101': '银行I', ... }
+    从 CSV 构建全维度映射字典
+    Dict Structure:
+    {
+        '110101': {'l1_c': '110000', 'l1_n': '农林牧渔', 'l2_c': ..., 'l3_n': '种子'},
+        '801010': {'l1_c': '...', ...} (兼容指数代码)
+    }
     """
-    print("📚 正在从巨潮资讯构建申万代码字典...")
-    mapping = {}
-
-    # 🌟 核心修正: 必须使用 "申银万国行业分类标准"
-    target_symbol = "申银万国行业分类标准"
+    print(f"📚 正在加载映射文件: {file_path}")
+    if not os.path.exists(file_path):
+        print(f"❌ 文件未找到: {file_path}")
+        return {}
 
     try:
-        # 接口: 巨潮资讯-行业分类数据
-        df = ak.stock_industry_category_cninfo(symbol=target_symbol)
+        # 强制读取为字符串，避免代码前导0丢失
+        df = pd.read_csv(file_path, dtype=str)
 
-        if df is not None and not df.empty:
-            # df columns: ['类目编码', '类目名称', ...]
-            for _, row in df.iterrows():
-                code = str(row['类目编码']).strip()
-                name = str(row['类目名称']).strip()
-                mapping[code] = name
+        # 清理列名空格
+        df.columns = [c.strip() for c in df.columns]
 
-            print(f"   ✅ 字典构建成功! 收录 {len(mapping)} 条行业映射")
+        mapping = {}
 
-            # 抽样验证我们关心的代码
-            test_codes = ['440101', '480101', '480301']
-            print("   🧪 关键代码抽检 (Code -> Name):")
-            for c in test_codes:
-                print(f"      - {c} -> {mapping.get(c, '❌ 未找到')}")
+        for _, row in df.iterrows():
+            # 提取各级信息 (处理可能的空值)
+            l1_c = str(row.get('industry_level1_code', '')).strip()
+            l1_n = str(row.get('industry_level1_name', '')).strip()
+            l2_c = str(row.get('industry_level2_code', '')).strip()
+            l2_n = str(row.get('industry_level2_name', '')).strip()
+            l3_c = str(row.get('industry_level3_code', '')).strip()
+            l3_n = str(row.get('industry_level3_name', '')).strip()
 
-        else:
-            print("   ⚠️ 巨潮接口返回空，请检查网络或 AKShare 版本。")
+            # 构造完整数据包
+            full_info = {
+                "level1_code": l1_c, "level1_name": l1_n,
+                "level2_code": l2_c, "level2_name": l2_n,
+                "level3_code": l3_c, "level3_name": l3_n
+            }
+
+            # 策略: 将所有层级的代码都作为 Key 指向这个 Info
+            # 这样无论 API 返回的是一级还是三级代码，都能查到家族信息
+
+            if l3_c and l3_c.lower() != 'nan': mapping[l3_c] = full_info
+            if l2_c and l2_c.lower() != 'nan':
+                # 如果 L2 已经作为 Key 存在 (可能来自另一行)，不要覆盖，因为 L2 对应多个 L3
+                # 但对于"查询 L2 属于哪个 L1"，任意一行都是一样的。
+                # 为了简单，我们只存第一次出现的映射 (L2 -> L1 关系是固定的)
+                if l2_c not in mapping:
+                    mapping[l2_c] = full_info
+            if l1_c and l1_c.lower() != 'nan':
+                if l1_c not in mapping:
+                    mapping[l1_c] = full_info
+
+        print(f"✅ 映射字典构建完成，索引数: {len(mapping)}")
+        return mapping
 
     except Exception as e:
-        print(f"   ❌ 字典下载失败: {e}")
-
-    return mapping
+        print(f"❌ 读取 CSV 失败: {e}")
+        return {}
 
 def run():
-    print("🚀 启动 [申万行业数据修复流程]...")
+    print("🚀 启动 [行业全量重构脚本]...")
     db = get_db()
     col = db[COLLECTION_NAME]
 
-    # 1. 构建正确的字典
-    industry_map = build_correct_mapping()
+    # 1. 清空旧数据 (慎重操作)
+    print(f"🗑️  正在清空表 [{COLLECTION_NAME}]...")
+    col.delete_many({})
+    print("   已清空。")
 
-    if not industry_map:
-        print("❌ 无法构建映射字典，无法继续。")
+    # 2. 加载映射
+    hierarchy_map = load_full_hierarchy_map(MAPPING_FILE)
+    if not hierarchy_map:
+        print("❌ 缺少映射文件，无法继续。")
         return
 
-    # 2. 获取历史变动数据
-    print("\n📡 请求申万个股历史数据 (stock_industry_clf_hist_sw)...")
+    # 3. 下载线上数据
+    print("📡 正在拉取申万个股历史数据 (ak.stock_industry_clf_hist_sw)...")
     try:
         df_hist = ak.stock_industry_clf_hist_sw()
-        print(f"   ✅ 获取历史数据: {len(df_hist)} 条")
+        print(f"✅ 获取成功! 原始记录: {len(df_hist)} 条")
     except Exception as e:
-        print(f"   ❌ 历史数据下载失败: {e}")
+        print(f"❌ 下载失败: {e}")
         return
 
-    # 3. 清洗与入库
-    print("⚙️ 正在执行映射与入库...")
+    if df_hist is None or df_hist.empty:
+        return
+
+    # 4. 处理与入库
+    print("⚙️  正在进行层级映射与入库...")
     requests = []
-    mapped_count = 0
+    matched_count = 0
 
-    pbar = tqdm(df_hist.iterrows(), total=len(df_hist))
-
-    for _, row in pbar:
+    # 这里的 tqdm 显示进度
+    for _, row in tqdm(df_hist.iterrows(), total=len(df_hist)):
         symbol = str(row['symbol'])
 
-        # 修复 1: 字段名 start_date -> date (解决 MongoDB 索引冲突)
+        # 日期处理
         date_raw = row.get('start_date')
         if pd.isna(date_raw) or str(date_raw) == 'NaT':
             continue
         date_str = str(date_raw).split(" ")[0]
 
-        # 获取代码
-        code = str(row['industry_code'])
+        # 行业代码 (这是 API 返回的)
+        raw_code = str(row.get('industry_code', '')).strip()
 
-        # 修复 2: 使用字典翻译中文名
-        industry_name = industry_map.get(code)
+        # 查字典
+        info = hierarchy_map.get(raw_code)
 
-        if industry_name:
-            mapped_count += 1
-        else:
-            # 找不到就保留 SW_Code，防止空值
-            industry_name = f"SW_{code}"
-
-        # 构造文档
-        filter_doc = {
+        # 构造基础文档
+        doc = {
             "symbol": symbol,
-            "date": date_str
+            "date": date_str,
+            "source": "SHENWAN",
+            "industry_code": raw_code, # 保留原始代码
+            "updated_at": datetime.now()
         }
 
-        update_doc = {
-            "$set": {
-                "industry_code": code,
-                "industry_name": industry_name, # 终于有中文名了！
-                "source": "SHENWAN",
-                "type": "INDUSTRY",
-                "updated_at": datetime.now()
-            }
-        }
+        if info:
+            # 匹配成功: 注入全层级信息
+            doc.update({
+                "is_mapped": True,
+                # 核心层级
+                "level1_code": info['level1_code'],
+                "level1_name": info['level1_name'],
+                "level2_code": info['level2_code'],
+                "level2_name": info['level2_name'],
+                "level3_code": info['level3_code'],
+                "level3_name": info['level3_name'],
+                # 兼容旧字段 (优先显示最细粒度名称)
+                "industry_name": info['level3_name'] or info['level2_name'] or info['level1_name']
+            })
+            matched_count += 1
+        else:
+            # 匹配失败: 可能是旧版代码 (如 440101) 不在 2021 版 CSV 里
+            doc.update({
+                "is_mapped": False,
+                "industry_name": f"Unknown_{raw_code}"
+            })
 
-        requests.append(UpdateOne(filter_doc, update_doc, upsert=True))
+        # 构造 Upsert 请求 (虽然表已空，但用 upsert 更安全)
+        requests.append(UpdateOne(
+            {"symbol": symbol, "date": date_str},
+            {"$set": doc},
+            upsert=True
+        ))
 
+        # 批量写入
         if len(requests) >= 2000:
-            try:
-                col.bulk_write(requests, ordered=False)
-                requests = []
-            except Exception:
-                pass
-
-    if requests:
-        try:
             col.bulk_write(requests, ordered=False)
-        except Exception:
-            pass
+            requests = []
 
-    print(f"\n✅ 修复完成。")
-    print(f"   - 成功汉化率: {mapped_count / len(df_hist):.1%}")
+    # 剩余写入
+    if requests:
+        col.bulk_write(requests, ordered=False)
 
-    # 最终验证
-    print("\n🔍 [最终验证] 000001 (平安银行) 行业变迁:")
-    cursor = col.find({"symbol": "000001"}).sort("date", 1)
-    for doc in cursor:
-        print(f"   📅 {doc['date']}: {doc['industry_name']} (Code: {doc['industry_code']})")
+    # 5. 总结
+    print("\n" + "="*40)
+    print(f"🎉 重构完成!")
+    print(f"   - 数据库记录数: {col.count_documents({})}")
+    print(f"   - 成功映射层级: {matched_count} ({(matched_count/len(df_hist)):.1%})")
+
+    if matched_count < len(df_hist) * 0.5:
+        print("⚠️ 警告: 匹配率较低。这通常是因为线上历史数据包含大量 2014 版旧代码 (4xxxx)，")
+        print("   而你的 CSV 仅包含 2021 版新代码 (11xxxx/801xxx)。")
+        print("   建议: 对于未映射的记录，回测时可能无法获取其板块归属。")
+
+    # 抽样
+    print("\n🔍 [抽样检查] 000001:")
+    cursor = col.find({"symbol": "000001"}).sort("date", -1).limit(3)
+    for d in cursor:
+        print(f"   {d['date']}: {d.get('industry_name')} (Mapped: {d.get('is_mapped')})")
 
 if __name__ == "__main__":
     run()

@@ -20,7 +20,7 @@ from vnpy.trader.constant import Exchange, Interval
 
 # --- ⚡ 核心配置 ---
 socket.setdefaulttimeout(20)  # 强制防卡死
-CSV_PATH = "delisted_data_audit.csv"
+CSV_PATH = "data/delisted_data_audit.csv"
 DB_NAME = "vnpy_stock"
 
 # 数据库连接

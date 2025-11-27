@@ -122,7 +122,7 @@ def run_audit():
     print(summary)
 
     # 导出 CSV
-    csv_file = "delisted_data_audit.csv"
+    csv_file = "data/delisted_data_audit.csv"
     df.sort_values(by="status").to_csv(csv_file, index=False, encoding="utf-8-sig")
     print(f"\n📝 详细报告已保存至: {os.path.abspath(csv_file)}")
 
