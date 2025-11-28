@@ -1,7 +1,7 @@
 """
 Script 09: Download Trading Calendar
 ------------------------------------
-功能: 下载 A股 历史交易日历
+功能: 下载 A股 历史交易日历 每月运行一次差不多了
 来源: 新浪财经 (tool_trade_date_hist_sina)
 存储: vnpy_master.trading_calendar
 """

@@ -1,7 +1,7 @@
 """
 Script 10: Rebuild Industry History with Full Hierarchy
 -------------------------------------------------------
-目标: 重构行业历史表 (industry_history)
+目标: 重构行业历史表 (industry_history)  申万有更新再运行
 流程:
 1. [清理] 清空现有 industry_history 表 (从零开始)。
 2. [映射] 读取本地 sw_2021.csv (Sheet1), 构建全层级映射字典 (Code -> L1/L2/L3)。

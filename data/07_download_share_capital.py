@@ -1,16 +1,17 @@
 """
-Script 07: Download Share Capital History (MongoDB Version) - Fixed
--------------------------------------------------------------------
-修复记录:
-1. 适配 AKShare stock_share_change_cninfo 返回的新列名 (总股本/已流通股份)
-2. 修正单位问题: 源数据为[万股], 入库转换为 [股]
-3. 增加 start_date 参数，确保拉取完整历史数据
+Script 07 (V2.0): Download Share Capital History (Incremental Update)
+---------------------------------------------------------------------
+目标: 增量下载股票股本变动历史 (share_capital)。
+策略:
+  1. 查询数据库中该股票已有的最新变动日期 (date)。
+  2. 设定 API 的 start_date 为该最新日期的前一天 (安全回溯)。
+  3. 仅下载新增的记录。
 """
 
 import akshare as ak
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from pymongo import MongoClient, UpdateOne
 
@@ -21,6 +22,8 @@ MONGO_HOST = "localhost"
 MONGO_PORT = 27017
 DB_NAME = "vnpy_stock"
 COLLECTION_NAME = "share_capital"
+# 首次下载的起始日期
+INITIAL_START_DATE = "19900101"
 
 def get_db():
     """获取数据库连接"""
@@ -28,48 +31,61 @@ def get_db():
     return client[DB_NAME]
 
 def get_stock_list() -> list:
-    """获取待下载的股票列表"""
+    """获取待下载的股票列表 (从本地 stock_info 获取)"""
     db = get_db()
-
-    # 尝试 1: 从基础信息表获取
-    cursor = db["stock_info"].find({}, {"symbol": 1})
+    # 优先从 stock_info 获取 A 股/北交所代码
+    cursor = db["stock_info"].find(
+        {"category": {"$in": ["STOCK_A", "STOCK_BJ", "UNKNOWN_A"]}},
+        {"symbol": 1}
+    )
     symbols = [doc["symbol"] for doc in cursor]
-
-    # 尝试 2: 如果为空，从行情表获取
-    if not symbols:
-        symbols = db["bar_daily"].distinct("symbol")
-
-    # 尝试 3: 在线兜底
-    if not symbols:
-        print("⚠️ 本地数据库无股票列表，从 AKShare 在线获取全A股列表...")
-        try:
-            df = ak.stock_zh_a_spot_em()
-            symbols = df['code'].tolist()
-        except Exception as e:
-            print(f"❌ 在线获取失败: {e}")
-            return []
-
     return sorted(list(set(symbols)))
+
+def get_last_recorded_date(symbol: str, db) -> str:
+    """
+    [NEW] 查询数据库中该股票股本变动的最新日期，并返回下一天的 YYYYMMDD 格式。
+    """
+    doc = db[COLLECTION_NAME].find_one(
+        {"symbol": symbol},
+        sort=[("date", -1)],
+        projection={"date": 1}
+    )
+
+    if doc and 'date' in doc:
+        # DB 存储格式是 YYYY-MM-DD
+        latest_dt = datetime.strptime(doc['date'], "%Y-%m-%d")
+        # 安全起见，从最新记录的**当天**开始重新下载（让 upsert 覆盖重复记录）
+        return latest_dt.strftime("%Y%m%d")
+
+    # 如果没有记录，返回全局起始日期
+    return INITIAL_START_DATE
 
 def download_and_save(symbol: str, db):
     """
-    下载单个股票的股本变动并存入 MongoDB
+    下载单个股票的股本变动并存入 MongoDB (增量模式)
     """
+
+    # 1. 获取增量起始日期
+    start_date_str = get_last_recorded_date(symbol, db)
+
+    # 如果最新日期是今天，则无需更新
+    today_str = datetime.now().strftime("%Y%m%d")
+    if start_date_str == today_str:
+        return 0
+
     try:
-        # 1. 接口调用
-        # 显式指定 start_date 为很早的日期，确保拿到上市以来的所有变动
-        current_date = datetime.now().strftime("%Y%m%d")
+        # 2. 接口调用 (使用增量起始日期)
+        current_date = today_str
         df = ak.stock_share_change_cninfo(
             symbol=symbol,
-            start_date="19900101",
+            start_date=start_date_str, # ✅ 使用增量日期
             end_date=current_date
         )
 
         if df is None or df.empty:
-            return
+            return 0
 
-        # 2. 字段映射 (根据 Debug 结果修正)
-        # 原始列: ['变动日期', '总股本', '已流通股份', '变动原因', ...]
+        # 3. 字段映射和清洗
         rename_map = {
             '变动日期': 'date',
             '总股本': 'total_shares',
@@ -77,26 +93,18 @@ def download_and_save(symbol: str, db):
             '变动原因': 'change_reason'
         }
 
-        # 检查关键列是否存在
         if not set(rename_map.keys()).issubset(df.columns):
-            # print(f"⚠️ {symbol} 列名不匹配，跳过")
-            return
+            return 0
 
         df = df.rename(columns=rename_map)
 
-        # 3. 数据清洗
-        # 日期格式化: datetime.date -> str (YYYY-MM-DD)
         df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
 
-        # 数值清洗:
-        # a. 填充 NaN 为 0
-        # b. 单位转换: 万股 -> 股 (* 10000)
         def clean_shares(val):
             if pd.isna(val) or val == '':
                 return 0.0
             try:
-                # 假设源数据单位是 万股
-                return float(val) * 10000
+                return float(val) * 10000 # 万股 -> 股
             except:
                 return 0.0
 
@@ -122,14 +130,16 @@ def download_and_save(symbol: str, db):
 
         if requests:
             db[COLLECTION_NAME].bulk_write(requests)
+            return len(requests)
+
+        return 0
 
     except Exception as e:
         # print(f"Error {symbol}: {e}")
-        pass
+        return 0
 
 def run():
-    print("🚀 启动 [A股股本变动下载器] (Fixed Version)...")
-    print("📋 配置: 单位[万股->股] | 历史回溯[1990+]")
+    print("🚀 启动 [A股股本变动下载器] (增量 V2.0)...")
 
     db = get_db()
     symbols = get_stock_list()
@@ -141,12 +151,19 @@ def run():
     # 简单进度条
     pbar = tqdm(symbols)
     for symbol in pbar:
-        pbar.set_description(f"下载 {symbol}")
+        # 检查是否需要跳过（如果是最新日期则不显示）
+        start_date_check = get_last_recorded_date(symbol, db)
+        today_str = datetime.now().strftime("%Y%m%d")
+
+        if start_date_check == today_str:
+            pbar.set_description(f"跳过 {symbol} (已最新)")
+            continue
+
+        pbar.set_description(f"下载 {symbol} (Start: {start_date_check})")
         download_and_save(symbol, db)
-        # 稍微快一点，cninfo 接口通常比较耐抗，但还是保留微小延时
         time.sleep(0.1)
 
-    print("\n✅ 下载完成。请运行 verify_share_capital.py 进行最终核验。")
+    print("\n✅ 增量下载完成。")
 
 if __name__ == "__main__":
     run()
