@@ -101,6 +101,7 @@ def save_bars_sina_full(symbol, exchange, df):
                 "volume": vol_share,
                 "turnover": amount_rmb,
                 "turnover_rate": t_rate,
+                "outstanding_share": outstanding,
                 "gateway_name": "AKSHARE_SINA"
             }
             # 过滤器确保唯一性

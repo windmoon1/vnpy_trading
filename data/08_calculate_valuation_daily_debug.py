@@ -1,334 +1,284 @@
 """
-脚本 08 (DEBUG V11): 估值指标计算器 - 生产健壮性最终版
+脚本 08: 全市场每日估值指标计算器 (V18 - 股本合并修复版)
 --------------------------------------------------------------
-目标: 1. 打印所有原始字段供用户审计 (核心需求)。
-      2. 启用健壮的 TTM 滚动和 PB/BPS 报告期更新逻辑。
-      3. 确保程序稳定运行。
+修复: 修改 Market Data 合并逻辑，由 Inner Join 改为 Left Join + FFill。
+      解决因股本数据日期对齐问题导致的数据丢失（只剩几十条）的问题。
 """
 import pandas as pd
 from datetime import datetime, date
 from tqdm import tqdm
 from pymongo import MongoClient, UpdateOne, ASCENDING, DESCENDING
 import numpy as np
-from typing import List, Dict, Any
 
-# --- 配置 ---
+# ================= 配置区域 =================
+DEBUG_MODE = True  # 调试完成后改为 False
+DEBUG_SYMBOLS = ["600519", "601398"]
+# ===========================================
+
 MONGO_HOST = "localhost"
 MONGO_PORT = 27017
 DB_NAME = "vnpy_stock"
 CLIENT = MongoClient(MONGO_HOST, MONGO_PORT)
 DB = CLIENT[DB_NAME]
 
-# 集合定义 (保持不变)
 COL_INFO = DB["stock_info"]
 COL_BARS = DB["bar_daily"]
 COL_CAPITAL = DB["share_capital"]
 COL_INCOME = DB["finance_income"]
 COL_BALANCE = DB["finance_balance"]
+COL_VALUATION = DB["valuation_daily"]
 COL_INDUSTRY = DB["industry_history"]
 
-# 关键财务字段 (用于计算逻辑)
-NET_PROFIT_FIELD = "净利润"
-REVENUE_FIELDS_CANDIDATE = ["营业总收入", "营业收入"]
-EQUITY_FIELDS_CANDIDATE = [
-    "归属于母公司股东权益合计",
-    "归属于母公司股东的权益",
-    "归属于上市公司股东的权益",
-    "所有者权益合计",
-    "股东权益合计",
-]
-FINANCIAL_UNIT_CONVERSION = 1
-TEST_SYMBOLS = ["600519", "601398"]
+# --- 关键字段映射 ---
+NET_PROFIT_FIELDS = ["归属于母公司所有者的净利润", "归属于母公司股东的净利润", "归属于母公司的净利润", "净利润"]
+REVENUE_FIELDS = ["营业总收入", "营业收入"]
+EQUITY_FIELDS = ["归属于母公司股东权益合计", "归属于母公司股东的权益", "归属于上市公司股东的权益", "所有者权益合计", "股东权益合计"]
+OTHER_EQUITY_FIELD = "其他权益工具"
 
+def get_clean_financial_data(symbol: str) -> pd.DataFrame:
+    """提取并清洗财务数据"""
+    proj_bal = {"report_date": 1, "publish_date": 1, OTHER_EQUITY_FIELD: 1}
+    for f in EQUITY_FIELDS: proj_bal[f] = 1
+    proj_inc = {"report_date": 1, "publish_date": 1}
+    for f in NET_PROFIT_FIELDS + REVENUE_FIELDS: proj_inc[f] = 1
 
-def dump_raw_fields(symbol: str, name: str):
-    """【审计核心】: 打印最新的资产负债表和利润表中的所有字段"""
-    print(f"\n--- 🔎 {symbol} ({name}) 原始财务数据审计 ---")
+    cursor_bal = COL_BALANCE.find({"symbol": symbol}, proj_bal).sort("report_date", ASCENDING)
+    df_bal = pd.DataFrame(list(cursor_bal))
+    cursor_inc = COL_INCOME.find({"symbol": symbol}, proj_inc).sort("report_date", ASCENDING)
+    df_inc = pd.DataFrame(list(cursor_inc))
 
-    # 1. 资产负债表 (BALANCE)
-    latest_balance = DB["finance_balance"].find_one({"symbol": symbol}, sort=[("report_date", DESCENDING)])
-    if latest_balance:
-        print(f"  [资产负债表] 报告期: {latest_balance.get('report_date').strftime('%Y-%m-%d')} | 公告日: {latest_balance.get('publish_date').strftime('%Y-%m-%d')}")
-        for k, v in latest_balance.items():
-            if k not in ['_id', 'symbol', 'exchange', 'gateway_name', 'data_source', 'currency', 'update_date', 'type', 'is_audited']:
-                # 针对大数字显示截断，避免屏幕过长
-                v_str = f"{v:,.0f}" if isinstance(v, (int, float)) else str(v)
-                print(f"    - {k:<35}: {v_str}")
+    if df_bal.empty and df_inc.empty: return pd.DataFrame()
+
+    if not df_bal.empty:
+        df_bal[OTHER_EQUITY_FIELD] = pd.to_numeric(df_bal.get(OTHER_EQUITY_FIELD), errors='coerce').fillna(0)
+        df_bal['total_equity'] = np.nan
+        for col in EQUITY_FIELDS:
+            if col in df_bal.columns:
+                df_bal['total_equity'] = df_bal['total_equity'].fillna(pd.to_numeric(df_bal[col], errors='coerce'))
+        df_bal['equity_adjusted'] = df_bal['total_equity'] - df_bal[OTHER_EQUITY_FIELD]
+        df_bal = df_bal.rename(columns={'publish_date': 'publish_date_bal'})
+        df_bal = df_bal[['report_date', 'publish_date_bal', 'equity_adjusted']].copy()
+
+    if not df_inc.empty:
+        df_inc['net_profit'] = np.nan
+        for col in NET_PROFIT_FIELDS:
+            if col in df_inc.columns:
+                df_inc['net_profit'] = df_inc['net_profit'].fillna(pd.to_numeric(df_inc[col], errors='coerce'))
+        df_inc['revenue'] = np.nan
+        for col in REVENUE_FIELDS:
+            if col in df_inc.columns:
+                df_inc['revenue'] = df_inc['revenue'].fillna(pd.to_numeric(df_inc[col], errors='coerce'))
+        df_inc = df_inc.rename(columns={'publish_date': 'publish_date_inc'})
+        df_inc = df_inc[['report_date', 'publish_date_inc', 'net_profit', 'revenue']].copy()
+
+    if df_bal.empty: df = df_inc
+    elif df_inc.empty: df = df_bal
     else:
-        print("  [资产负债表] 未找到最新数据。")
+        df = pd.merge(df_inc, df_bal, on='report_date', how='outer')
 
-    # 2. 利润表 (INCOME)
-    latest_income = DB["finance_income"].find_one({"symbol": symbol}, sort=[("report_date", DESCENDING)])
-    if latest_income:
-        print(f"\n  [利润表] 报告期: {latest_income.get('report_date').strftime('%Y-%m-%d')} | 公告日: {latest_income.get('publish_date').strftime('%Y-%m-%d')}")
-        for k, v in latest_income.items():
-            if k not in ['_id', 'symbol', 'exchange', 'gateway_name', 'data_source', 'currency', 'update_date', 'type', 'is_audited']:
-                v_str = f"{v:,.0f}" if isinstance(v, (int, float)) else str(v)
-                print(f"    - {k:<35}: {v_str}")
-    else:
-        print("  [利润表] 未找到最新数据。")
-    print("----------------------------------------------------------------")
-
-
-def get_financial_data(symbol: str) -> pd.DataFrame:
-    """提取和统一财务数据 (保持 datetime64[ns] 类型)。"""
-
-    # ... (提取逻辑与 V10 保持一致)
-    balance_fields_to_pull = {"report_date": 1, "publish_date": 1}
-    for field in EQUITY_FIELDS_CANDIDATE: balance_fields_to_pull[field] = 1
-
-    balance_cursor = COL_BALANCE.find({"symbol": symbol}, balance_fields_to_pull).sort([("report_date", ASCENDING)])
-    df_balance = pd.DataFrame(list(balance_cursor))
-
-    if not df_balance.empty:
-        df_balance['total_equity_latest'] = np.nan
-        for field in EQUITY_FIELDS_CANDIDATE:
-            if field in df_balance.columns:
-                mask = df_balance['total_equity_latest'].isna() & df_balance[field].notna()
-                df_balance.loc[mask, 'total_equity_latest'] = df_balance.loc[mask, field]
-        df_balance = df_balance[['report_date', 'publish_date', 'total_equity_latest']].copy()
-
-    income_fields_to_pull = {"report_date": 1, "publish_date": 1, NET_PROFIT_FIELD: 1}
-    for field in REVENUE_FIELDS_CANDIDATE: income_fields_to_pull[field] = 1
-
-    income_cursor = COL_INCOME.find({"symbol": symbol}, income_fields_to_pull).sort([("report_date", ASCENDING)])
-    df_income = pd.DataFrame(list(income_cursor))
-
-    if not df_income.empty:
-        df_income = df_income.rename(columns={NET_PROFIT_FIELD: 'net_profit'})
-        df_income['revenue'] = np.nan
-        for field in REVENUE_FIELDS_CANDIDATE:
-            if field in df_income.columns:
-                mask = df_income['revenue'].isna() & df_income[field].notna()
-                df_income.loc[mask, 'revenue'] = df_income.loc[mask, field]
-        df_income = df_income[['report_date', 'publish_date', 'net_profit', 'revenue']].copy()
-
-    if df_balance.empty and df_income.empty: return pd.DataFrame()
-
-    df = pd.merge(df_income, df_balance, on=['report_date', 'publish_date'], how='outer', suffixes=('_inc', '_bal'))
-    df = df.dropna(subset=['report_date', 'publish_date'])
-
-    for col in ['net_profit', 'revenue', 'total_equity_latest']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce') * FINANCIAL_UNIT_CONVERSION
-
-    # 统一日期类型为 Timestamp
     df['report_date'] = pd.to_datetime(df['report_date'])
+    df['publish_date'] = df['publish_date_inc'].fillna(df['publish_date_bal'])
     df['publish_date'] = pd.to_datetime(df['publish_date'])
 
-    df = df.drop_duplicates(subset=['report_date'], keep='last')
+    df = df.dropna(subset=['report_date', 'publish_date'])
+    df = df.sort_values('publish_date').drop_duplicates('report_date', keep='last').sort_values('report_date')
 
-    return df.sort_values(by=['report_date', 'publish_date'], ascending=[True, True]).reset_index(drop=True)
+    return df
 
+def calculate_financial_time_series(df_fin: pd.DataFrame) -> pd.DataFrame:
+    """计算 TTM 和 LF 数据"""
+    if df_fin.empty: return pd.DataFrame()
 
-def calculate_rolling_ttm(df_financial: pd.DataFrame) -> pd.DataFrame:
-    """TTM 滚动计算 (完整的 TTM 逻辑，非年报也计算 TTM 值)"""
-    if df_financial.empty: return pd.DataFrame()
+    df_ttm = df_fin.copy().set_index('report_date').sort_index()
 
-    df_ttm_calc = df_financial.copy()
-    df_ttm_calc = df_ttm_calc.set_index('report_date').sort_index()
+    for metric in ['net_profit', 'revenue']:
+        ttm_col = f"{metric}_ttm"
+        df_ttm[ttm_col] = np.nan
+        for date_idx in df_ttm.index:
+            if date_idx.month == 12:
+                df_ttm.loc[date_idx, ttm_col] = df_ttm.loc[date_idx, metric]
+            elif date_idx.month in [3, 6, 9]:
+                last_year = date_idx.year - 1
+                try:
+                    prev_same = df_ttm.at[date_idx.replace(year=last_year), metric]
+                    prev_ann = df_ttm.at[datetime(last_year, 12, 31), metric]
+                    if pd.notna(prev_same) and pd.notna(prev_ann):
+                        df_ttm.loc[date_idx, ttm_col] = df_ttm.loc[date_idx, metric] + (prev_ann - prev_same)
+                except KeyError: pass
 
-    df_ttm_calc['year'] = df_ttm_calc.index.year
-    df_ttm_calc['month'] = df_ttm_calc.index.month
-    df_ttm_calc['is_annual'] = (df_ttm_calc['month'] == 12)
+    df_q4 = df_ttm[df_ttm.index.month == 12].copy()
+    df_q4 = df_q4[['net_profit']].rename(columns={'net_profit': 'net_profit_lf'})
 
-    def calculate_ttm_series(series_name: str) -> pd.Series:
-        """核心 TTM 滚动计算，基于 Report Date 的年/月/日查找"""
-        series = df_ttm_calc[series_name]
-        ttm_series = pd.Series(index=series.index, dtype=float)
+    df_ttm = df_ttm.reset_index()
+    df_ttm = pd.merge(df_ttm, df_q4, left_on='report_date', right_index=True, how='left')
 
-        for current_date in series.index:
-            current_value = series.loc[current_date]
-            if pd.isna(current_value): continue
+    df_pub = df_ttm.dropna(subset=['publish_date']).sort_values('publish_date')
+    df_pub['net_profit_lf'] = df_pub['net_profit_lf'].ffill()
+    df_pub['report_date_audit'] = df_pub['report_date']
 
-            current_month = current_date.month
-            current_year = current_date.year
+    return df_pub.set_index('publish_date')
 
-            if current_month == 12:
-                ttm_series.loc[current_date] = current_value
+def calculate_one_stock(symbol: str):
+    """单只股票计算逻辑"""
 
-            elif current_month in [3, 6, 9]:
-                last_year = current_year - 1
+    # 1. 准备财务数据
+    df_fin = get_clean_financial_data(symbol)
+    if df_fin.empty: return []
 
-                # 寻找去年同期的报告值 (使用 year/month/day 匹配)
-                last_same_date_match = series.index[(series.index.year == last_year) & (series.index.month == current_date.month) & (series.index.day == current_date.day)]
-                last_annual_date_match = series.index[(series.index.year == last_year) & (series.index.month == 12) & (series.index.day == 31)]
+    df_fin_pub = calculate_financial_time_series(df_fin)
+    if df_fin_pub.empty: return []
 
-                last_same_value = series.loc[last_same_date_match[0]] if len(last_same_date_match) > 0 else np.nan
-                last_annual_value = series.loc[last_annual_date_match[0]] if len(last_annual_date_match) > 0 else np.nan
-
-                if pd.notna(last_same_value) and pd.notna(last_annual_value):
-                    ttm = current_value - last_same_value + last_annual_value
-                    ttm_series.loc[current_date] = ttm
-        return ttm_series
-
-    # 2. 计算各项 TTM
-    df_ttm_calc['net_profit_ttm'] = calculate_ttm_series('net_profit')
-    df_ttm_calc['revenue_ttm'] = calculate_ttm_series('revenue')
-
-    # 3. 提取最新年报净利润 (LF)
-    df_q4 = df_ttm_calc[df_ttm_calc['is_annual']].rename(columns={'net_profit': 'net_profit_lf'})
-
-    # 4. 合并 TTM 结果，并转换为以 **公告日** (publish_date) 为索引的序列
-    df_result = df_ttm_calc[['publish_date', 'total_equity_latest', 'net_profit_ttm', 'revenue_ttm']].copy()
-
-    # PB/BPS 报告日期始终更新到最新的报告期
-    df_result['report_date_pb'] = df_result.index
-    df_result['publish_date_pb'] = df_result['publish_date']
-
-    # PE/PS 报告日期：使用 TTM 净利润/收入有值的报告期
-    df_result['pe_report_date'] = df_result['report_date_pb'].where(df_ttm_calc['net_profit_ttm'].notna(), pd.NaT)
-
-    df_result = df_result.reset_index(drop=True).set_index('publish_date').sort_index()
-
-    # 5. 合并静态年报数据（LF）
-    df_q4 = df_q4.rename(columns={'publish_date': 'date'}).set_index('date').sort_index()
-    df_q4 = df_q4[['net_profit_lf']]
-    df_result = df_result.join(df_q4, how='left')
-
-    # 6. 转换时间序列：以公告日为时间轴，FFILL
-    if df_result.empty: return pd.DataFrame()
-    min_pub_date = df_result.index.min().to_datetime64()
-
-    full_dates = pd.date_range(start=min_pub_date, end=datetime.now().date(), freq='D')
-    df_full = pd.DataFrame(index=full_dates)
-
-    df_full = df_full.join(df_result, how='left')
-
-    fill_cols = [
-        'total_equity_latest', 'net_profit_ttm', 'net_profit_lf', 'revenue_ttm',
-        'report_date_pb', 'publish_date_pb', 'pe_report_date'
-    ]
-    df_full[fill_cols] = df_full[fill_cols].ffill()
-
-    return df_full.drop_duplicates(keep='last').rename_axis('date')
-
-
-def get_latest_industry(symbol: str) -> str:
-    """获取股票最新的申万行业分类"""
-    doc = DB[COL_INDUSTRY.name].find_one({"symbol": symbol}, sort=[("date", DESCENDING)])
-    return doc.get('industry_name', 'UNKNOWN') if doc else 'UNKNOWN'
-
-def run_single_stock_calculation(symbol: str):
-    """主计算函数"""
-    info_doc = COL_INFO.find_one({"symbol": symbol})
-    if not info_doc: return
-
-    name = info_doc.get('name', symbol)
-
-    # --- V8 步骤 1: 打印原始字段供审计 ---
-    dump_raw_fields(symbol, name)
-
-    print(f"\n============================================================")
-    print(f"       🚀 正在计算 {symbol} ({name}) 的估值指标 (V11)")
-    print(f"============================================================")
-
-    # 0. 获取行业信息
-    industry = get_latest_industry(symbol)
-
-    # 1. 提取所有数据
-    df_financial = get_financial_data(symbol)
-    df_financial_ts = calculate_rolling_ttm(df_financial)
-    if df_financial_ts.empty:
-        print(f"   ⚠️ 警告：无法生成 {symbol} 的财务时间序列。")
-        return
-
-    # 3. 提取日线价格/股本
-    bars_cursor = COL_BARS.find({"symbol": symbol}, {"datetime": 1, "close_price": 1}).sort([("datetime", ASCENDING)])
-    df_bars = pd.DataFrame(list(bars_cursor))
+    # 2. 准备市场数据
+    cursor_bars = COL_BARS.find({"symbol": symbol}, {"datetime": 1, "close_price": 1}).sort("datetime", ASCENDING)
+    df_bars = pd.DataFrame(list(cursor_bars))
+    if df_bars.empty: return []
     df_bars['date'] = pd.to_datetime(df_bars['datetime'])
-    df_bars = df_bars.set_index('date').drop(columns=['datetime', '_id'])
+    df_bars = df_bars.set_index('date')[['close_price']]
 
-    capital_cursor = COL_CAPITAL.find({"symbol": symbol}, {"date": 1, "total_shares": 1, "float_shares": 1}).sort([("date", ASCENDING)])
-    df_capital = pd.DataFrame(list(capital_cursor))
-    df_capital['date'] = pd.to_datetime(df_capital['date'])
-    df_capital = df_capital.set_index('date').drop(columns=['_id'])
+    cursor_cap = COL_CAPITAL.find({"symbol": symbol}, {"date": 1, "total_shares": 1, "float_shares": 1}).sort("date", ASCENDING)
+    df_cap = pd.DataFrame(list(cursor_cap))
+    if df_cap.empty: return []
+    df_cap['date'] = pd.to_datetime(df_cap['date'])
+    df_cap = df_cap.set_index('date')[['total_shares', 'float_shares']]
 
-    # 5. 核心合并逻辑: Left Join
-    all_dates = df_bars.index.union(df_capital.index)
-    df_master = pd.DataFrame(index=all_dates)
+    # 3. 合并市场数据 (【核心修复】：Left Join + FFill)
+    # 以行情为准，股本对不上的地方向前填充
+    df_market = df_bars.join(df_cap, how='left')
+    df_market['total_shares'] = df_market['total_shares'].ffill()
+    df_market['float_shares'] = df_market['float_shares'].ffill()
 
-    df_all = df_master.join(df_bars).join(df_capital)
-    df_all['total_shares'] = df_all['total_shares'].ffill()
-    df_all['float_shares'] = df_all['float_shares'].ffill()
-    df_all = df_all.join(df_financial_ts, how='left')
+    # 删除上市前没有股本数据的行
+    df_market = df_market.dropna(subset=['total_shares'])
 
-    df_all = df_all.dropna(subset=['close_price', 'total_shares', 'total_equity_latest']).copy()
+    df_market = df_market.sort_index()
+    df_fin_pub = df_fin_pub.sort_index()
 
-    if df_all.empty:
-        print(f"   ⚠️ 警告：合并后无有效数据进行计算。")
-        return
+    # 4. Merge AsOf (防未来)
+    df_daily = pd.merge_asof(
+        df_market,
+        df_fin_pub[['equity_adjusted', 'net_profit_ttm', 'revenue_ttm', 'net_profit_lf', 'report_date_audit']],
+        left_index=True,
+        right_index=True,
+        direction='backward'
+    )
 
-    print(f"  - 数据合并完毕，共 {len(df_all)} 个交易日数据。")
+    # 5. 计算指标
+    df_calc = df_daily.dropna(subset=['close_price', 'total_shares', 'equity_adjusted']).copy()
+    if df_calc.empty: return []
 
-    # 6. 计算估值指标
-    df = df_all
+    df_calc['total_mv'] = df_calc['close_price'] * df_calc['total_shares']
+    df_calc['circ_mv'] = df_calc['close_price'] * df_calc['float_shares']
+    df_calc['bps'] = df_calc['equity_adjusted'] / df_calc['total_shares']
+    df_calc['eps_ttm'] = np.where(df_calc['net_profit_ttm'].notna(), df_calc['net_profit_ttm'] / df_calc['total_shares'], None)
 
-    df['total_mv'] = df['close_price'] * df['total_shares']
-    df['circ_mv'] = df['close_price'] * df['float_shares'].fillna(df['total_shares'])
+    df_calc['pb_lf'] = df_calc['total_mv'] / df_calc['equity_adjusted']
+    df_calc['pe_ttm'] = np.where(df_calc['net_profit_ttm'] > 0, df_calc['total_mv'] / df_calc['net_profit_ttm'], None)
+    df_calc['pe_lf'] = np.where(df_calc['net_profit_lf'] > 0, df_calc['total_mv'] / df_calc['net_profit_lf'], None)
+    df_calc['ps_ttm'] = np.where(df_calc['revenue_ttm'] > 0, df_calc['total_mv'] / df_calc['revenue_ttm'], None)
+    df_calc['roe_ttm'] = np.where(df_calc['equity_adjusted'] > 0, df_calc['net_profit_ttm'] / df_calc['equity_adjusted'], None)
+    df_calc['dv_ratio'] = None
 
-    df['bps'] = df['total_equity_latest'] / df['total_shares']
-    df['eps_ttm'] = df['net_profit_ttm'] / df['total_shares']
-    df['pb_lf'] = df['total_mv'] / df['total_equity_latest']
+    # 获取行业
+    industry_doc = COL_INDUSTRY.find_one({"symbol": symbol}, sort=[("date", DESCENDING)])
+    industry_name = industry_doc.get('industry_name', 'Unknown') if industry_doc else 'Unknown'
 
-    pe_ttm_mask = df['net_profit_ttm'] > 0
-    df.loc[pe_ttm_mask, 'pe_ttm'] = df.loc[pe_ttm_mask, 'total_mv'] / df.loc[pe_ttm_mask, 'net_profit_ttm']
+    updates = []
+    for date_idx, row in df_calc.iterrows():
+        report_dt = row['report_date_audit']
+        report_dt_ts = datetime.combine(report_dt, datetime.min.time()) if isinstance(report_dt, date) else report_dt
 
-    pe_lf_mask = df['net_profit_lf'] > 0
-    df.loc[pe_lf_mask, 'pe_lf'] = df.loc[pe_lf_mask, 'total_mv'] / df.loc[pe_lf_mask, 'net_profit_lf']
+        doc = {
+            "symbol": symbol,
+            "date": date_idx,
+            "close_price": row['close_price'],
+            "industry": industry_name,
+            "total_shares": row['total_shares'],
+            "float_shares": row['float_shares'],
+            "total_mv": row['total_mv'],
+            "circ_mv": row['circ_mv'],
+            "bps": row['bps'],
+            "eps_ttm": row['eps_ttm'],
+            "pe_ttm": row['pe_ttm'],
+            "pe_lf": row['pe_lf'],
+            "pb_lf": row['pb_lf'],
+            "ps_ttm": row['ps_ttm'],
+            "dv_ratio": row['dv_ratio'],
+            "roe_ttm": row['roe_ttm'],
+            "net_profit_ttm": row['net_profit_ttm'] if pd.notna(row['net_profit_ttm']) else None,
+            "net_profit_lf": row['net_profit_lf'] if pd.notna(row['net_profit_lf']) else None,
+            "total_equity_latest": row['equity_adjusted'],
+            "revenue_ttm": row['revenue_ttm'] if pd.notna(row['revenue_ttm']) else None,
+            "report_date_pb": report_dt_ts,
+            "publish_date_pb": date_idx
+        }
 
-    ps_ttm_mask = df['revenue_ttm'].notna() & (df['revenue_ttm'] > 0)
-    df.loc[ps_ttm_mask, 'ps_ttm'] = df.loc[ps_ttm_mask, 'total_mv'] / df.loc[ps_ttm_mask, 'revenue_ttm']
+        clean_doc = {}
+        for k, v in doc.items():
+            if v is None: continue
+            if isinstance(v, float) and (np.isnan(v) or np.isinf(v)): continue
+            if isinstance(v, pd.Timestamp) and pd.isna(v): continue
+            clean_doc[k] = v
 
-    roe_ttm_mask = (df['total_equity_latest'] > 0)
-    df.loc[roe_ttm_mask, 'roe_ttm'] = df.loc[roe_ttm_mask, 'net_profit_ttm'] / df.loc[roe_ttm_mask, 'total_equity_latest']
+        updates.append(UpdateOne(
+            {"symbol": symbol, "date": date_idx},
+            {"$set": clean_doc},
+            upsert=True
+        ))
 
-    # 7. 整理输出结果
-    latest_data = df.iloc[-1]
+    return updates
 
-    circ_share_warning = ""
-    if symbol == "601398":
-        circ_share_warning = f"【注意：底层股本数据与东财存在差异，东财流通股本为 2696.12 亿股】"
+def run_debug():
+    """调试模式"""
+    print(f"🛠️ 启动 [调试模式] - 目标: {DEBUG_SYMBOLS}")
+    COL_VALUATION.create_index([("symbol", ASCENDING), ("date", ASCENDING)], unique=True)
 
-    output = {
-        "股票代码/名称": f"{symbol} ({name})",
-        "申万行业": industry,
-        "---------------------": "最新行情与规模",
-        "最新交易日": latest_data.name.strftime("%Y-%m-%d"),
-        "收盘价 (元)": f"{latest_data['close_price']:,.2f}",
-        "总股本 (亿股)": f"{latest_data['total_shares']/1e8:,.2f}",
-        "流通股本 (亿股)": f"{latest_data['float_shares']/1e8:,.2f} {circ_share_warning}",
-        "总市值 (亿元)": f"{latest_data['total_mv']/1e8:,.2f}",
-        "流通市值 (亿元)": f"{latest_data['circ_mv']/1e8:,.2f}",
-        "---------------------": "核心估值指标",
-        "每股净资产 (BPS)": f"{latest_data['bps']:,.4f}",
-        "每股收益 (EPS_TTM)": f"{latest_data['eps_ttm']:,.4f}" if pd.notna(latest_data['eps_ttm']) else 'N/A',
-        "市净率 (PB_LF)": f"{latest_data['pb_lf']:,.2f}",
-        "滚动市盈率 (PE_TTM)": f"{latest_data['pe_ttm']:,.2f}" if pd.notna(latest_data['pe_ttm']) else 'N/A',
-        "静态市盈率 (PE_LF)": f"{latest_data['pe_lf']:,.2f}" if pd.notna(latest_data['pe_lf']) else 'N/A',
-        "滚动市销率 (PS_TTM)": f"{latest_data['ps_ttm']:,.2f}" if pd.notna(latest_data['ps_ttm']) else 'N/A',
-        "TTM 净资产收益率 (ROE_TTM)": f"{latest_data['roe_ttm']*100:,.2f}%" if pd.notna(latest_data['roe_ttm']) else 'N/A',
-        "---------------------": "审计信息 (财务分母)",
-        "最新归母净资产 (元)": f"{latest_data['total_equity_latest']:,.0f}",
-        "滚动 TTM 净利润 (元)": f"{latest_data['net_profit_ttm']:,.0f}" if pd.notna(latest_data['net_profit_ttm']) else 'N/A',
-        "最新年报净利润 (元)": f"{latest_data['net_profit_lf']:,.0f}" if pd.notna(latest_data['net_profit_lf']) else 'N/A',
-        "滚动 TTM 营业收入 (元)": f"{latest_data['revenue_ttm']:,.0f}" if pd.notna(latest_data['revenue_ttm']) else 'N/A',
-        "PB/BPS对应报告期": latest_data['report_date_pb'].strftime("%Y-%m-%d") if pd.notna(latest_data['report_date_pb']) else 'N/A',
-        "PB/BPS对应公告日": latest_data['publish_date_pb'].strftime("%Y-%m-%d") if pd.notna(latest_data['publish_date_pb']) else 'N/A',
-        "PE/PS对应报告期": latest_data['pe_report_date'].strftime("%Y-%m-%d") if pd.notna(latest_data['pe_report_date']) else 'N/A',
-    }
-
-    print("\n✅ 最新估值指标快照:")
-    for key, value in output.items():
-        print(f"   {key:<25}: {value}")
-
-
-def run():
-    for symbol in TEST_SYMBOLS:
+    for symbol in DEBUG_SYMBOLS:
+        print(f"\n⚡ 处理: {symbol}")
         try:
-            run_single_stock_calculation(symbol)
+            updates = calculate_one_stock(symbol)
+            if not updates:
+                print(f"   ⚠️ 无数据")
+                continue
+
+            print(f"   ✅ 生成 {len(updates)} 条记录")
+            first, last = updates[0]._doc['$set'], updates[-1]._doc['$set']
+            print(f"   📅 [首] {first['date']} | PE: {first.get('pe_ttm')} | PB: {first.get('pb_lf')}")
+            print(f"   📅 [末] {last['date']} | PE: {last.get('pe_ttm')} | PB: {last.get('pb_lf')}")
+
+            print(f"   💾 写入 DB...")
+            COL_VALUATION.bulk_write(updates, ordered=False)
+            print("   OK.")
+
         except Exception as e:
-            print(f"\n   ❌ 致命错误: 处理 {symbol} 时发生异常: {e}")
+            print(f"   ❌ 错误: {e}")
+            import traceback; traceback.print_exc()
+
+def run_production():
+    """生产模式"""
+    print("🚀 启动 [生产模式]...")
+    COL_VALUATION.create_index([("symbol", ASCENDING), ("date", ASCENDING)], unique=True)
+
+    stocks = list(COL_INFO.find({}, {"symbol": 1, "name": 1}))
+    tasks = [s for s in stocks if not s['symbol'].startswith("8100")]
+    print(f"📋 任务数: {len(tasks)}")
+
+    batch = []
+    for s in tqdm(tasks):
+        try:
+            ops = calculate_one_stock(s['symbol'])
+            if ops:
+                batch.extend(ops)
+            if len(batch) >= 5000:
+                COL_VALUATION.bulk_write(batch, ordered=False)
+                batch = []
+        except: continue
+
+    if batch:
+        COL_VALUATION.bulk_write(batch, ordered=False)
+    print("\n🎉 完成！")
 
 if __name__ == "__main__":
-    run()
+    if DEBUG_MODE:
+        run_debug()
+    else:
+        run_production()
