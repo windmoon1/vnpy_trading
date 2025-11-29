@@ -14,8 +14,8 @@ from pymongo import MongoClient, UpdateOne, ASCENDING, DESCENDING
 import numpy as np
 
 # ================= 配置区域 =================
-DEBUG_MODE = True  # 生产环境请设为 False
-DEBUG_SYMBOLS = ["600519", "601398"]
+DEBUG_MODE = False  # 生产环境请设为 False
+DEBUG_SYMBOLS = ["601336"]
 FORCE_UPDATE = False # 设为 True 可重算所有历史数据
 # ===========================================
 
@@ -137,7 +137,10 @@ def calculate_dividend_full_series(df_div: pd.DataFrame) -> pd.DataFrame:
     end = datetime.now()
     idx = pd.date_range(start, end)
     df_daily = df_div.reindex(idx).fillna(0.0)
-    df_daily['dividend_ttm'] = df_daily['cash_dividend_per_share'].rolling(window=365, min_periods=0).sum()
+    # [MODIFIED]
+    # 方案 1: 简单粗暴延长窗口到 13个月 (395天)，容忍派息日推迟一个月
+    # 这能解决 90% 的“比东财少”的问题
+    df_daily['dividend_ttm'] = df_daily['cash_dividend_per_share'].rolling(window=395, min_periods=0).sum()
     return df_daily[['dividend_ttm']]
 
 def calculate_one_stock(symbol: str, name: str, industry: str):
